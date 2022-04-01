@@ -1,0 +1,358 @@
+---
+title: "Housing Prices Prediction"
+author: "Scott Lovelady"
+date: "12/5/2021"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+options(repos = list(CRAN="http://cran.rstudio.com/"))
+```
+
+
+## loading packages
+```{r}
+#check if packages are installed. if not, install the package
+pckg=c("ggplot2","dplyr","ggmap","caret","leaps","ranger")
+for(i in 1:length(pckg)) 
+   {
+      print(pckg[i])
+      if (!is.element(pckg[i], installed.packages()[,1]))
+      install.packages(pckg[i], dep = TRUE)
+      require(pckg[i], character.only = TRUE)
+}
+```
+
+## User created functions
+```{r}
+# NA value counter
+na_counter <- function(dset) {
+  missing_values <- which(colSums(is.na(dset)) > 0)
+  sort(colSums(sapply(dset[missing_values], is.na)), decreasing = TRUE)
+}
+
+# Kaggle submission creator
+submission <- function(model, test, method = 'standard') {
+  if (method == 'log') { # if the target variable uses log in the model we need to convert this back for the prediction.
+    a <- test %>% 
+      select(Id) %>% 
+      mutate(SalePrice = exp(predict(object = model, newdata = test)))
+    write.csv(a,'submission_file.csv', row.names=FALSE)
+  } 
+  else {
+    a <- test %>% 
+      select(Id) %>% 
+      mutate(SalePrice = predict(object = model, newdata = test))
+    write.csv(a,'submission_file.csv', row.names=FALSE)
+  }
+}
+
+rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2))
+
+r2 <- function(actual, predicted){
+  TSS <- sum((actual - mean(actual))^2)
+  RSS <- sum((actual - predicted)^2)
+  1 - RSS/TSS
+}
+
+# Calculates mode of a data set
+calc_mode <- function(x){ # Function found: https://www.codingprof.com/how-to-replace-nas-with-the-mode-most-frequent-value-in-r/
+  # List the distinct / unique values
+  distinct_values <- unique(x)
+  # Count the occurrence of each distinct value
+  distinct_tabulate <- tabulate(match(x, distinct_values))
+  # Return the value with the highest occurrence
+  distinct_values[which.max(distinct_tabulate)]
+}
+```
+
+## Importing data
+```{r}
+# Import data
+training <- read.csv('train.csv')
+test <- read.csv('test.csv')
+```
+
+## Understanding the data 
+```{r}
+# Glimpse of data
+glimpse(training)
+
+# Summary of data
+summary(training)
+```
+
+## Understanding the data with visualizations
+```{r}
+# Plotting distribution of sale price
+ggplot(training, aes(x = SalePrice)) +
+  geom_histogram()+
+  labs(title = "Distribution of Sales Prices")
+
+# Plotting key data
+ggplot(training, aes(x = SalePrice, y = LotArea)) +
+  geom_point()+
+  labs(title = "Sales Price by Lot Size")
+```
+
+# Data cleaning
+
+## Combining datasets
+```{r}
+# creating identifiers so data sets can be separated after cleaning
+training$ident <- T
+test <- test %>%
+  mutate(ident = F,
+         SalePrice = NA)
+
+# combining the data
+df <- rbind(training, test)
+summary(df)
+```
+
+## Missing data
+```{r}
+# Count missing values by column
+na_counter(df)
+```
+
+## NA meaning none
+```{r}
+# Columns where NA means none
+na_none <- c("Alley", "BsmtQual", "BsmtCond", "MasVnrType", "BsmtExposure", "BsmtFinType1", "BsmtFinType2", "FireplaceQu", "GarageType", "GarageFinish", "GarageQual", "GarageCond", "PoolQC", "Fence", "MiscFeature")
+
+#assigns "None" to NAs for applicable columns identified above
+df[na_none][is.na(df[na_none])] <- "None"
+
+# Did it work?
+na_counter(df)
+```
+
+## NA meaning 0
+```{r}
+# Columns where NA means 0
+na_zero <- c("LotFrontage", "GarageYrBlt", "MasVnrArea", "BsmtFullBath", "BsmtHalfBath", "BsmtFinSF1", "BsmtFinSF2", "BsmtUnfSF", "GarageCars", "GarageArea")
+
+#assigns 0 to NAs for applicable columns identified above
+df[na_zero][is.na(df[na_zero])] <- 0
+
+# Checking the number of missing values
+na_counter(df)
+```
+## Dealing with the other NA's
+```{r}
+# Viewing the rows which have missing values to better decide what do do with them.
+df_temp <- df %>%
+          select(- SalePrice)
+
+missing_values_rows <- df_temp[rowSums(is.na(df_temp)) > 0,]
+missing_values_rows
+```
+
+```{r}
+# Changing NA to most common value (mode)
+df$MSZoning[is.na(df$MSZoning)] <- calc_mode(df$MSZoning)
+
+# Changing NA to defined value
+df$Utilities[is.na(df$Utilities)] <- "AllPub" # Default value
+df$Electrical[is.na(df$Electrical)] <- "SBrkr" # Standard value
+df$Functional[is.na(df$Functional)] <- "Typ" # From data description: (Assume typical unless deductions are warranted)
+df$KitchenQual[is.na(df$KitchenQual)] <- "TA" # Typical / Average
+df$SaleType[is.na(df$SaleType)] <- "Oth" # Other value
+df$Exterior1st[is.na(df$Exterior1st)] <- "Other" # Other value
+df$Exterior2nd[is.na(df$Exterior2nd)] <- "Other" # Other value
+
+# Changing NA to calculation
+df$TotalBsmtSF[is.na(df$TotalBsmtSF)] <- df$BsmtFinSF1 + df$BsmtFinSF2 + df$BsmtUnfSF #This equals 0, but it could be important if there were any other NA's in a new dataset
+
+na_counter(df)
+```
+## Fixing wrong datatypes
+```{r}
+# Converting to factors
+df <- df %>%
+  mutate(MSSubClass = factor(MSSubClass),
+         MSZoning = factor(MSZoning),
+         Street = factor(Street, order = TRUE, levels = c('Grvl', 'Pave')),
+         Alley = factor(Alley, order = TRUE, levels = c('None', 'Grvl', 'Pave')),
+         LotShape = factor(LotShape, order = TRUE, levels = c('None', 'IR3', 'IR2', 'IR1', 'Reg')),
+         LandContour = factor(LandContour),
+         Utilities = factor(Utilities, order = TRUE, levels = c('ELO', 'NoSeWa', 'NoSewr', 'AllPub')),
+         LotConfig = factor(LotConfig),
+         LandSlope = factor(LandSlope, order = TRUE, levels = c('Sev', 'Mod', 'Gtl')),
+         Neighborhood = factor(Neighborhood),
+         Condition1 = factor(Condition1),
+         Condition2 = factor(Condition2),
+         BldgType = factor(BldgType),
+         HouseStyle = factor(HouseStyle),
+         RoofStyle = factor(RoofStyle),
+         RoofMatl = factor(RoofMatl),
+         Exterior1st = factor(Exterior1st),
+         Exterior2nd = factor(Exterior2nd),
+         MasVnrType = factor(MasVnrType),
+         ExterQual = factor(ExterQual, order = TRUE, levels = c('None', 'Po','Fa','TA','Gd','Ex')),
+         ExterCond = factor(ExterCond, order = TRUE, levels = c('None', 'Po','Fa','TA','Gd','Ex')),
+         Foundation = factor(Foundation),
+         BsmtQual = factor(BsmtQual, order = TRUE, levels = c('None', 'Po','Fa','TA','Gd','Ex')),
+         BsmtCond = factor(BsmtCond, order = TRUE, levels = c('None', 'Po','Fa','TA','Gd','Ex')),
+         BsmtExposure = factor(BsmtExposure, order = TRUE, levels = c('None', 'No','Mn','Av','Gd')),
+         BsmtFinType1 = factor(BsmtFinType1, order = TRUE, levels = c('None', 'Unf','LwQ','Rec','BLQ','ALQ','GLQ')),
+         BsmtFinType2 = factor(BsmtFinType2, order = TRUE, levels = c('None', 'Unf','LwQ','Rec','BLQ','ALQ','GLQ')),
+         Heating = factor(Heating),
+         HeatingQC = factor(HeatingQC, order = TRUE, levels = c('None', 'Po','Fa','TA','Gd','Ex')),
+         CentralAir = factor(CentralAir, order = TRUE, levels = c('N','Y')),
+         Electrical = factor(Electrical),
+         KitchenQual = factor(KitchenQual, order = TRUE, levels = c('None', 'Po','Fa','TA','Gd','Ex')),
+         Functional = factor(Functional, order = TRUE, levels = c('Sal','Sev','Maj2','Maj1','Mod','Min2','Min1','Typ')),
+         FireplaceQu = factor(FireplaceQu, order = TRUE, levels = c('None', 'Po','Fa','TA','Gd','Ex')),
+         GarageType = factor(GarageType),
+         GarageFinish = factor(GarageFinish, order = TRUE, levels = c('None', 'Unf','RFn','Fin')),
+         GarageQual = factor(GarageQual, order = TRUE, levels = c('None',  'Po','Fa','TA','Gd','Ex')),
+         GarageCond = factor(GarageCond, order = TRUE, levels = c('None',  'Po','Fa','TA','Gd','Ex')),
+         PavedDrive = factor(PavedDrive, order = TRUE, levels = c('None', 'N','P','Y')),
+         PoolQC = factor(PoolQC, order = TRUE, levels = c('None', 'Fa','TA','Gd','Ex')),
+         Fence = factor(Fence, order = TRUE, levels = c('None', 'MnWw','GdWo','MnPrv','GdPrv')),
+         MiscFeature = factor(MiscFeature),
+         MoSold = factor(MoSold),
+         YrSold = factor(YrSold),
+         SaleType = factor(SaleType),
+         SaleCondition = factor(SaleCondition)) 
+```
+
+## Creating scores
+```{r}
+# Creating numerical scores from categorical data for quality variables
+qual <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+
+df$ExterQualScore <- as.integer(recode(df$ExterQual, !!!qual))
+df$ExterCondScore <- as.integer(recode(df$ExterCond, !!!qual))
+df$BsmtQualScore <- as.integer(recode(df$BsmtQual, !!!qual))
+df$BsmtCondScore <- as.integer(recode(df$BsmtCond, !!!qual))
+df$HeatingQCScore <- as.integer(recode(df$HeatingQC, !!!qual))
+df$KitchenQualScore <- as.integer(recode(df$KitchenQual, !!!qual))
+df$FireplaceQuScore <- as.integer(recode(df$FireplaceQu, !!!qual))
+df$GarageQualScore <- as.integer(recode(df$GarageQual, !!!qual))
+df$GarageCondScore <- as.integer(recode(df$GarageCond, !!!qual))
+df$PoolQualScore <- as.integer(recode(df$PoolQC, !!!qual))
+
+# Creating aggregated scores 
+df$TotalQualScore <- df$ExterQualScore + df$ExterCondScore + df$BsmtQualScore + df$BsmtCondScore + df$HeatingQCScore + df$KitchenQualScore + df$FireplaceQuScore + df$GarageQualScore + df$GarageCondScore + df$PoolQualScore
+
+df$TotalExterQualScore <- df$ExterQualScore + df$ExterCondScore
+
+df$TotalBsmtQualScore <- df$BsmtQualScore + df$BsmtCondScore
+
+df$IndoorQualScore <- df$HeatingQCScore + df$KitchenQualScore + df$FireplaceQuScore
+
+df$TotalGarageQualScore <- df$GarageQualScore + df$GarageCondScore 
+
+# Total bathrooms
+df$TotalBath <- df$BsmtFullBath + (df$BsmtHalfBath * 0.5) + df$FullBath + (df$HalfBath * 0.5)
+
+# Total square feet
+df$TotalSqFt <- df$TotalBsmtSF + df$GrLivArea
+
+# Dropping columns that were aggregated and replaced above
+df <- df %>%
+  select(-ExterQualScore, -ExterCondScore, -BsmtQualScore, -BsmtCondScore, -HeatingQCScore, -KitchenQualScore, -FireplaceQuScore, -GarageQualScore, -GarageCondScore)
+```
+## Separating the training and the test data
+```{r}
+training <- df[df$ident==T,]
+test  <- df[df$ident==F,]
+```
+
+
+# Model creation
+
+## Single linear model
+```{r}
+# Baseline model
+(house_price_model <- lm(SalePrice ~ Neighborhood, data = training)) %>%
+  summary
+
+submission(house_price_model, test, 0)
+```
+
+
+```{r}
+#5 variable model
+#iterate over training data to populate new data frame with column name and R squared of simple regressions for each column
+h <- data.frame()
+for(x in names(training)) {
+    simple <- summary(lm(SalePrice ~ training[[x]], data = training))
+    h <- rbind(h,list(x, simple$r.squared))
+  } 
+colnames(h) <- c("variable", "r2")
+
+#remove duplicate rows, ordered by r2
+h <- h %>%
+  distinct() %>%
+  filter(r2 < 1) %>%
+  arrange(desc(r2))
+
+#multiple linear model using top 5 columns (ordered by R^2) and skipping a column if it is likely multicollinear with a previously used column
+(mmr2 <- lm(SalePrice ~ OverallQual + TotalSqFt + Neighborhood + GarageCars + TotalBath, data = training)) %>%
+  summary
+
+submission(mmr2, test, 'log')
+```
+
+```{r}
+(model2 <- lm(log(SalePrice) ~ OverallQual + TotalSqFt + TotalQualScore + GarageCars + TotalBath, data = training)) %>%
+  summary
+
+submission(model2, test, 'log')
+```
+## Model performance with lm
+Kaggle score: 0.16311 rank: #2933
+
+```{r}
+((model3 <- lm(log(SalePrice) ~ OverallQual + OverallQual^2 + Neighborhood + OverallCond + log(GrLivArea) + GrLivArea^4 + TotalBsmtSF * BsmtQual+ TotalBsmtSF^2 + MSZoning * log(LotArea) + YearBuilt + YearBuilt^20 + BldgType * HouseStyle + RoofMatl + KitchenQual + GarageArea + GarageType + IndoorQualScore + TotalBath + SaleCondition + LotConfig, data = training)) %>%
+  summary)
+```
+
+## Model performance with random forest
+```{r}
+set.seed(123)
+
+rf <- train(log(SalePrice) ~ OverallQual + OverallQual^2 + Neighborhood + OverallCond + log(GrLivArea) + GrLivArea^4 + TotalBsmtSF * BsmtQual+ TotalBsmtSF^2 + MSZoning + YearBuilt + YearBuilt^20 + BldgType * HouseStyle + RoofMatl + KitchenQual + GarageArea + GarageType + IndoorQualScore + TotalBath + SaleCondition + LotConfig, method = 'ranger',  data = training)
+```
+
+## RMSE on training dataset
+```{r}
+rmse(training$SalePrice, predict(rf, newdata= training)) 
+```
+
+## R-squared on training dataset
+```{r}
+r2(training$SalePrice, exp(predict(rf, newdata= training)))
+```
+
+#Testing the test data by calculating the Salesprice using the lm and random forest 
+```{r}
+submit <- test %>%
+  mutate(SalePrice = (exp(predict(model3, newdata = test))+exp(predict(rf, newdata = test)))/2)
+```
+
+# RMSE and R-squared on test dataset
+```{r}
+rmse(submit$SalePrice, predict(rf, newdata= submit)) 
+
+r2(submit$SalePrice, exp(predict(rf, newdata= submit)))
+```
+
+##Selecting ID and salesprice column
+```{r}
+submit <- submit %>%
+  select(Id, SalePrice)
+```
+
+#Exporting the data to CSV file for submission 
+```{r}
+write.csv(submit,'stacked_submission_file.csv', row.names=FALSE)
+```
